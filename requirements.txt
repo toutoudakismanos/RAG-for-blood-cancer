@@ -4,3 +4,5 @@ regex
 transformers 
 datasets 
 sentencepiece
+torch
+sacremoses
