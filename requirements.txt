@@ -7,3 +7,5 @@ sentencepiece
 torch
 sacremoses
 nltk
+sentence_transformers
+faiss-cpu
