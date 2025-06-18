@@ -1,91 +1,69 @@
-import faiss
+# rag_model.py
+"""
+Υλοποίηση pipeline RAG με FAISS + Open-Source generator
+"""
 import os
+from pathlib import Path
+import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from transformers import pipeline
-from nltk.tokenize import word_tokenize
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-# ===== PATHS =====
-input_dir = './assignment_corpus/en/mayoclinic'
-filtered_dir = './assignment_corpus/en/filtered'
-translated_dir = './assignment_corpus/en/translated'
+# Ρυθμίσεις
+EN_FILTERED = Path('./assignment_corpus/en/filtered')
+EL_FILTERED = Path('./assignment_corpus/el/filtered')  # δημιουργείται από τα επόμενα βήματα
+EMB_MODEL_EN = 'all-mpnet-base-v2'
+EMB_MODEL_MULTI = 'sentence-transformers/paraphrase-multilingual-mpnet-base-v2'
+GEN_MODEL = 't5-base'
 
+class MedicalRAG:
+    def __init__(self, emb_model_name, gen_model_name, index_path=None):
+        # Φόρτωση embedding
+        self.embedder = SentenceTransformer(emb_model_name)
+        # Φόρτωση generator
+        self.tokenizer = AutoTokenizer.from_pretrained(gen_model_name)
+        self.generator = AutoModelForSeq2SeqLM.from_pretrained(gen_model_name)
+        # FAISS index
+        self.dim = self.embedder.get_sentence_embedding_dimension()
+        if index_path and Path(index_path).exists():
+            self.index = faiss.read_index(index_path)
+        else:
+            self.index = faiss.IndexFlatL2(self.dim)
+            self._build_index(EN_FILTERED, emb_model_name)
 
-# 1. Προετοιμασία δεδομένων για RAG
-def load_documents(lang='en'):
-    path = filtered_dir if lang == 'en' else translated_dir
-    documents = []
-    for filename in os.listdir(path):
-        with open(os.path.join(path, filename), 'r', encoding='utf-8') as f:
-            documents.append(f.read())
-    return documents
+    def _build_index(self, docs_folder: Path, emb_model_name: str):
+        texts = []
+        for f in docs_folder.glob('*.txt'):
+            texts.append(f.read_text(encoding='utf-8'))
+        embeddings = self.embedder.encode(texts, convert_to_numpy=True)
+        self.index.add(embeddings)
+        # Προαιρετικά: αποθήκευση
+        faiss.write_index(self.index, 'faiss_index.idx')
 
-# 2. Δημιουργία Vector DB
-def create_vector_db(documents, lang):
-    model_name = 'sentence-transformers/all-MiniLM-L6-v2' if lang == 'en' \
-        else 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
-    
-    model = SentenceTransformer(model_name)
-    embeddings = model.encode(documents)
-    
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(np.array(embeddings).astype('float32'))
-    
-    return index, model, documents
+    def retrieve(self, query: str, k: int = 5):
+        q_emb = self.embedder.encode([query], convert_to_numpy=True)
+        D, I = self.index.search(q_emb, k)
+        return I[0]  # δείκτες εγγράφων
 
-# 3. RAG Pipeline
-class RAGSystem:
-    def __init__(self, lang='en'):
-        self.lang = lang
-        self.documents = load_documents(lang)
-        self.index, self.retriever, _ = create_vector_db(self.documents, lang)
-        self.generator = pipeline(
-            "text2text-generation", 
-            model="google/flan-t5-base",
-            max_length=512
-        )
-    
-    def retrieve(self, query, k=5):
-        query_embedding = self.retriever.encode([query])
-        _, indices = self.index.search(query_embedding.astype('float32'), k)
-        return [self.documents[i] for i in indices[0]]
-    
-    def generate_answer(self, question):
-        context = " ".join(self.retrieve(question))
-        input_text = f"question: {question} context: {context}"
-        return self.generator(input_text)[0]['generated_text']
+    def generate(self, query: str, docs: list):
+        # Συνένωση query+docs
+        input_text = query + ' \n'.join(docs)
+        inputs = self.tokenizer(input_text, return_tensors='pt', truncation=True, max_length=512)
+        outputs = self.generator.generate(**inputs)
+        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-# 4. Δοκιμή συστήματος
-def test_rag():
-    # Δοκιμή στα Αγγλικά
-    en_rag = RAGSystem(lang='en')
-    en_questions = [
-        "What is the treatment for leukemia?",
-        "How is lymphoma diagnosed?",
-        "What are the symptoms of myeloma?",
-        "Explain stem cell transplantation.",
-        "What is CAR-T therapy?"
-    ]
-    
-    # Δοκιμή στα Ελληνικά
-    el_rag = RAGSystem(lang='el')
-    el_questions = [
-        "Ποια είναι η θεραπεία για τη λευχαιμία;",
-        "Πώς διαγιγνώσκεται το λέμφωμα;",
-        "Ποια είναι τα συμπτώματα του μυελώματος;",
-        "Εξηγήστε τη μεταμόσχευση βλαστοκυττάρων.",
-        "Τι είναι η θεραπεία CAR-T;"
-    ]
-    
-    # Απαντήσεις και αξιολόγηση
-    for q in en_questions:
-        answer = en_rag.generate_answer(q)
-        print(f"Q: {q}\nA: {answer}\n")
-    
-    for q in el_questions:
-        answer = el_rag.generate_answer(q)
-        print(f"Q: {q}\nA: {answer}\n")
+    def answer(self, query: str, docs_folder: Path, k: int = 5):
+        idxs = self.retrieve(query, k)
+        docs = []
+        files = list(docs_folder.glob('*.txt'))
+        for i in idxs:
+            docs.append(files[i].read_text(encoding='utf-8'))
+        return self.generate(query, docs)
 
-# Εκτέλεση δοκιμών
-test_rag()
+# Παράδειγμα χρήσης:
+if __name__ == '__main__':
+    rag = MedicalRAG(EMB_MODEL_EN, GEN_MODEL)
+    q = "What are the symptoms of leukemia?"
+    ans = rag.answer(q, EN_FILTERED)
+    print("Q:", q)
+    print("A:", ans)
