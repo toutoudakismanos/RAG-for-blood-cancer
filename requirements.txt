@@ -9,3 +9,10 @@ sacremoses
 nltk
 sentence_transformers
 faiss-cpu
+langdetect
+protobuf
+langchain 
+langchain-community 
+sentence-transformers 
+faiss-cpu 
+llama-cpp-python
